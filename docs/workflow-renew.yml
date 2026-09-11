@@ -2,8 +2,8 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    # 每 4 小时检查一次(Free 套餐到期前 1 天开放续期,高频轮询保证第一时间续上)
-    - cron: '17 */4 * * *'
+    # 每天检查一次;未到续期窗口时脚本幂等退出(exit 0)
+    - cron: '17 3 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -25,7 +25,6 @@ jobs:
           node-version: '20'
 
       - name: Renew
-        id: renew
         continue-on-error: true
         env:
           ACL_SESSION: ${{ secrets.ACL_SESSION }}
