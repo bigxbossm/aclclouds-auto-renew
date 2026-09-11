@@ -92,17 +92,30 @@ async function renew(id) {
   return r;
 }
 
+const REMEMBER_COOKIE = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d';
+
+function seedEnvCookies() {
+  // 关键:先把导出的会话 cookie 放进 jar,再访问站点,
+  // 否则 warmup() 会拿到匿名会话导致 401
+  if (process.env.ACL_SESSION) jar['__Host-aclclouds_session'] = process.env.ACL_SESSION;
+  if (process.env.ACL_REMEMBER) jar[REMEMBER_COOKIE] = process.env.ACL_REMEMBER;
+}
+
+async function ensureAuth() {
+  seedEnvCookies();
+  await warmup(); // 带 session 请求首页,刷新 XSRF-TOKEN(可能轮换 session,均记入 jar)
+  if (process.env.ACL_SESSION) return true;
+  return login();
+}
+
 async function main() {
   log(`目标: ${BASE}${SERVER_ID ? ` (server ${SERVER_ID})` : ' (自动发现)'}`);
   if (DRY_RUN) log('DRY_RUN 模式: 仅查看,不续期');
 
-  await warmup();
-  if (!jar['__Host-aclclouds_session']) {
-    const ok = await login();
-    if (!ok) {
-      console.error('缺少会话: 请设置 ACL_SESSION(从浏览器导出 __Host-aclclouds_session cookie)');
-      process.exit(1);
-    }
+  const authed = await ensureAuth();
+  if (!authed) {
+    console.error('缺少会话: 请设置 ACL_SESSION(从浏览器导出 __Host-aclclouds_session cookie)或 ACL_EMAIL/ACL_PASSWORD');
+    process.exit(1);
   }
 
   // 1) 确定目标服务器
@@ -134,8 +147,19 @@ async function main() {
       failed++;
       log('🤖 站点要求人机验证(captcha_required),请在浏览器完成一次后续期');
     } else if (r.status === 401) {
-      console.error('❌ 会话已失效(401),请重新导出 ACL_SESSION cookie');
-      process.exit(1);
+      log('会话失效(401),尝试用邮箱密码重新登录…');
+      let retried = false;
+      if (process.env.ACL_EMAIL && process.env.ACL_PASSWORD && await login()) {
+        const r2 = await renew(t.id);
+        if (r2.status === 200) { renewed++; log('✅ 重新登录后续期成功'); continue; }
+        retried = true;
+        log(`重试结果: HTTP ${r2.status} ${JSON.stringify(r2.data).slice(0, 200)}`);
+      }
+      if (!retried) {
+        console.error('❌ 会话已失效且无法自动重新登录,请重新导出 ACL_SESSION cookie');
+        process.exit(1);
+      }
+      failed++;
     } else {
       failed++;
       log(`⚠️ HTTP ${r.status}: ${JSON.stringify(r.data).slice(0, 300)}`);
