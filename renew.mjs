@@ -65,6 +65,8 @@ async function tg(text, { photos = false } = {}) {
   if (!photos) return;
   let n = 0;
   for (const photo of shots) {
+    const base = path.basename(photo);
+    if (/^(01-login|02-captcha)\.png$/i.test(base) || photo.includes(`${path.sep}captcha${path.sep}`)) continue;
     if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
     const form = new FormData();
     form.append('chat_id', chat);
