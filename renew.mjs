@@ -135,9 +135,73 @@ async function api(page, p, method = 'GET', body) {
     });
     const text = await res.text();
     let data;
-    try { data = JSON.parse(text); } catch { data = text; }
+    try { data = JSON.parse(text); } catch { data = text.slice(0, 400); }
     return { status: res.status, data };
   }, { p, method, body });
+}
+
+function collectIds(obj, out = new Set()) {
+  if (!obj) return out;
+  if (Array.isArray(obj)) { obj.forEach((x) => collectIds(x, out)); return out; }
+  if (typeof obj !== 'object') return out;
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string' && /^[a-z0-9-]{6,40}$/i.test(v) && /id|uuid|identifier/i.test(k)) out.add(v);
+    else if (v && typeof v === 'object') collectIds(v, out);
+  }
+  return out;
+}
+
+async function discover(page) {
+  const ids = new Set();
+  if (SERVER_ID) ids.add(SERVER_ID);
+  const pages = [
+    `${BASE}/dashboard`,
+    `${BASE}/dashboard/projects?type=discord`,
+    `${BASE}/dashboard/projects`,
+    `${BASE}/dashboard/billing/subscriptions`,
+  ];
+  if (SERVER_ID) pages.push(`${BASE}/server/${SERVER_ID}`);
+  const hrefs = [];
+  for (const url of pages) {
+    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const found = await page.evaluate(() => [...document.querySelectorAll('a[href]')].map((a) => a.href));
+    hrefs.push(...found);
+  }
+  for (const h of hrefs) {
+    const m = h.match(/\/(?:server|servers|project|projects|subscription|subscriptions)\/([a-z0-9-]{6,40})/i);
+    if (m) ids.add(m[1]);
+  }
+  const listPaths = [
+    '/api/client',
+    '/api/client/servers',
+    '/api/client/credits/subscriptions',
+    '/api/client/account',
+  ];
+  const dumps = [];
+  for (const p of listPaths) {
+    const r = await api(page, p);
+    dumps.push({ p, status: r.status, keys: r.data && typeof r.data === 'object' ? Object.keys(r.data).slice(0, 12) : String(r.data).slice(0, 80) });
+    collectIds(r.data, ids);
+    const arr = r.data?.data || r.data?.servers || r.data?.subscriptions || [];
+    if (Array.isArray(arr)) {
+      for (const s of arr) {
+        if (s?.id) ids.add(String(s.id));
+        if (s?.attributes?.identifier) ids.add(s.attributes.identifier);
+        if (s?.attributes?.uuid) ids.add(s.attributes.uuid);
+      }
+    }
+  }
+  log(`发现 ID: ${[...ids].join(', ') || '(无)'} dump=${JSON.stringify(dumps)}`);
+  return [...ids];
+}
+
+function classifyRenew(r) {
+  if (r.status === 200) return { ok: true, skip: false, text: `续期成功 ${JSON.stringify(r.data).slice(0, 180)}` };
+  if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
+    return { ok: true, skip: true, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
+  }
+  return { ok: false, skip: false, text: `HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 180)}` };
 }
 
 async function main() {
@@ -170,37 +234,48 @@ async function main() {
     await shot(page, '03-dashboard.png');
     log('登录成功');
 
-    let targets = [];
-    if (SERVER_ID) {
-      targets = [{ id: SERVER_ID, name: SERVER_ID }];
-    } else {
-      const r = await api(page, '/api/client/credits/subscriptions');
-      if (r.status !== 200) throw new Error(`订阅列表失败 HTTP ${r.status}`);
-      const subs = (r.data.subscriptions || []).filter((s) => s.kind === 'server' || s.plan_name);
-      targets = subs.map((s) => ({ id: s.id, name: s.name, expires_at: s.expires_at }));
-      log(`发现 ${targets.length} 个服务`);
+    const ids = await discover(page);
+    await page.goto(`${BASE}/dashboard/projects?type=discord`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await shot(page, '04-projects.png');
+    const btn = page.getByRole('button', { name: /renouvel|renew|续期/i }).first();
+    const link = page.getByRole('link', { name: /renouvel|renew|续期/i }).first();
+    if (await btn.count()) {
+      await btn.click().catch(() => {});
+      await page.waitForTimeout(1500);
+      await shot(page, '05-renew-click.png');
+    } else if (await link.count()) {
+      await link.click().catch(() => {});
+      await page.waitForTimeout(1500);
+      await shot(page, '05-renew-click.png');
     }
-    if (!targets.length) {
-      summary = '没有可续期的服务';
-    } else {
-      const t = targets[0];
-      await page.goto(`${BASE}/server/${t.id}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
-      await shot(page, '04-server.png');
-      if (DRY_RUN) {
-        summary = `DRY_RUN ${t.name}(${t.id})`;
-      } else {
-        const r = await api(page, `/api/client/servers/${t.id}/upgrade/renew`, 'POST', {});
-        log(`续期 HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 300)}`);
-        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-        await shot(page, '05-result.png');
-        if (r.status === 200) summary = `续期成功 ${t.name}(${t.id}) ${r.data?.expires_at || ''}`;
-        else if (r.status === 400 && r.data?.error === 'renewal_not_available') {
-          summary = `未到续期窗口 ${t.name}(${t.id}) 剩余 ${r.data.days_remaining ?? '?'} 天`;
-        } else {
-          failed = true;
-          summary = `续期失败 HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`;
-        }
+
+    const pathsFor = (id) => [
+      `/api/client/servers/${id}/upgrade/renew`,
+      `/api/client/servers/${id}/renew`,
+      `/api/client/account/servers/${id}/renew`,
+    ];
+    let best = null;
+    for (const id of ids) {
+      const exists = await api(page, `/api/client/servers/${id}`);
+      log(`GET /api/client/servers/${id} -> ${exists.status}`);
+      if (exists.status === 404) continue;
+      if (DRY_RUN) { best = { id, text: `DRY_RUN ${id} GET ${exists.status}` }; break; }
+      for (const p of pathsFor(id)) {
+        const r = await api(page, p, 'POST', {});
+        const c = classifyRenew(r);
+        log(`POST ${p} -> ${c.text}`);
+        if (c.ok) { best = { id, text: `${id} ${c.text}` }; break; }
+        if (!best) best = { id, text: `${id} ${c.text}` };
       }
+      if (best && !String(best.text).includes('失败') && !String(best.text).includes('HTTP 404')) break;
+    }
+    await shot(page, '06-result.png');
+    if (!best) {
+      failed = true;
+      summary = `未找到可续期服务 ids=${ids.join(',') || '空'}`;
+    } else {
+      summary = best.text;
+      failed = /失败|HTTP 401|HTTP 403|HTTP 404|HTTP 5/.test(summary) && !/未到续期窗口|续期成功|DRY_RUN/.test(summary);
     }
   } catch (e) {
     failed = true;
