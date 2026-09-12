@@ -2,7 +2,6 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    # 每天检查一次;未到续期窗口时脚本幂等退出(exit 0)
     - cron: '17 3 * * *'
   workflow_dispatch: {}
 
@@ -16,7 +15,7 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -24,22 +23,17 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
       - name: Renew
-        continue-on-error: true
         env:
-          ACL_SESSION: ${{ secrets.ACL_SESSION }}
-          ACL_REMEMBER: ${{ secrets.ACL_REMEMBER }}
-          ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
+          ACL_USERNAME: ${{ secrets.ACL_USERNAME }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           ACL_SERVER_ID: ${{ secrets.ACL_SERVER_ID }}
-        run: node renew.mjs | tee renew.log
-
-      - name: Job summary
-        if: always()
-        run: |
-          {
-            echo "## ACLClouds 续期结果"
-            echo '```'
-            cat renew.log 2>/dev/null || echo "(无输出)"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          ACL_BASE_URL: ${{ vars.ACL_BASE_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: node renew.mjs

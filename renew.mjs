@@ -1,174 +1,222 @@
 #!/usr/bin/env node
-/**
- * ACLClouds 免费 Bot 主机自动续期脚本(零依赖,Node >= 18)
- *
- * 原理(逆向自 aclclouds.com 前端 1459.js chunk):
- *   POST /api/client/servers/{id}/upgrade/renew
- *   - Laravel CSRF: 复用 cookie XSRF-TOKEN,放在 X-XSRF-TOKEN 请求头
- *   - 会话: cookie __Host-aclclouds_session(HttpOnly,需从浏览器导出)
- *   - 200 = 续期成功;400 renewal_not_available = 未到续期窗口(Free 套餐到期前 1 天开放)
- *   - 403 captcha_required = 站点要求人机验证,脚本无法自动处理
- *
- * 环境变量:
- *   ACL_SESSION   必填(或 ACL_EMAIL/ACL_PASSWORD) __Host-aclclouds_session cookie 值
- *   ACL_REMEMBER  可选  remember_web_... cookie 值(延长会话有效期)
- *   ACL_EMAIL     可选  邮箱(配合 ACL_PASSWORD 登录,实验性)
- *   ACL_PASSWORD  可选  密码
- *   ACL_SERVER_ID 可选  服务器 ID;缺省=自动发现所有 Free 服务并逐一续期
- *   ACL_BASE_URL  可选  默认 https://aclclouds.com
- *   DRY_RUN=1     可选  只查看状态,不实际续期
- */
+import { chromium } from 'playwright';
+import Tesseract from 'tesseract.js';
+import fs from 'fs';
+import path from 'path';
 
 const BASE = (process.env.ACL_BASE_URL || 'https://aclclouds.com').replace(/\/+$/, '');
+const USER = process.env.ACL_USERNAME || process.env.ACL_EMAIL || '';
+const PASS = process.env.ACL_PASSWORD || '';
 const SERVER_ID = process.env.ACL_SERVER_ID || '';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
+const SHOT = path.resolve('shots');
+const VOCAB = ['Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds', 'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated', 'Free', 'Upgrade', 'Renew'];
 
-const jar = {}; // name -> value
-
-function setCookieFromHeader(h) {
-  // h: "Name=Value; Path=/; ..."
-  const m = h.match(/^([^=]+)=([^;]*)/);
-  if (m) jar[m[1].trim()] = m[2];
-}
-
-function cookieHeader() {
-  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-async function req(path, { method = 'GET', body, json = true, retry = true } = {}) {
-  const res = await fetch(BASE + path, {
-    method,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) aclclouds-renew/1.0',
-      'Accept': json ? 'application/json' : 'text/html,application/xhtml+xml',
-      'X-Requested-With': 'XMLHttpRequest',
-      ...(jar['XSRF-TOKEN'] ? { 'X-XSRF-TOKEN': decodeURIComponent(jar['XSRF-TOKEN']) } : {}),
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-      ...(Object.keys(jar).length ? { Cookie: cookieHeader() } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    redirect: 'manual',
-  });
-  res.headers.getSetCookie?.().forEach(setCookieFromHeader);
-  const text = await res.text();
-  let data = null;
-  try { data = json ? JSON.parse(text) : text; } catch { data = text; }
-  // CSRF 过期自动重试一次(419)
-  if (res.status === 419 && retry) {
-    await warmup();
-    return req(path, { method, body, json, retry: false });
-  }
-  return { status: res.status, data };
-}
-
-async function warmup() {
-  // 访问首页拿 XSRF-TOKEN / session cookie
-  await req('/', { json: false });
-}
-
-async function login() {
-  const email = process.env.ACL_EMAIL, password = process.env.ACL_PASSWORD;
-  if (!email || !password) return false;
-  log('使用邮箱密码登录(实验性)…');
-  const r = await req('/auth/login', { method: 'POST', body: { email, password } });
-  if (r.status >= 200 && r.status < 300) { log('登录成功'); return true; }
-  log(`登录失败: HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`);
-  return false;
-}
+fs.mkdirSync(SHOT, { recursive: true });
+const shots = [];
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-async function listServers() {
-  const r = await req('/api/client/credits/subscriptions');
-  if (r.status !== 200) throw new Error(`获取订阅列表失败: HTTP ${r.status}`);
-  const subs = r.data.subscriptions || [];
-  return subs.filter(s => s.kind === 'server' || s.plan_name);
+function norm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
 }
 
-async function renew(id) {
-  const r = await req(`/api/client/servers/${id}/upgrade/renew`, { method: 'POST', body: {} });
-  return r;
+function score(a, b) {
+  a = norm(a);
+  b = norm(b);
+  if (!a || !b) return 0;
+  if (a === b) return 100;
+  if (a.includes(b) || b.includes(a)) return 80;
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+  }
+  return Math.max(0, 100 - dp[a.length][b.length] * 25);
 }
 
-const REMEMBER_COOKIE = 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d';
-
-function seedEnvCookies() {
-  // 关键:先把导出的会话 cookie 放进 jar,再访问站点,
-  // 否则 warmup() 会拿到匿名会话导致 401
-  if (process.env.ACL_SESSION) jar['__Host-aclclouds_session'] = process.env.ACL_SESSION;
-  if (process.env.ACL_REMEMBER) jar[REMEMBER_COOKIE] = process.env.ACL_REMEMBER;
+async function shot(page, name) {
+  const p = path.join(SHOT, name);
+  await page.screenshot({ path: p, fullPage: true });
+  shots.push(p);
+  log(`截图 ${name}`);
+  return p;
 }
 
-async function ensureAuth() {
-  seedEnvCookies();
-  await warmup(); // 带 session 请求首页,刷新 XSRF-TOKEN(可能轮换 session,均记入 jar)
-  if (process.env.ACL_SESSION) return true;
-  return login();
+async function tg(text) {
+  const token = process.env.TG_BOT_TOKEN;
+  const chat = process.env.TG_CHAT_ID;
+  if (!token || !chat) {
+    log('未配置 TG_BOT_TOKEN/TG_CHAT_ID,跳过通知');
+    return;
+  }
+  const msg = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
+  });
+  if (!msg.ok) log(`TG 文本失败: ${await msg.text()}`);
+  for (const photo of shots) {
+    if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
+    const form = new FormData();
+    form.append('chat_id', chat);
+    form.append('photo', new Blob([fs.readFileSync(photo)], { type: 'image/png' }), path.basename(photo));
+    form.append('caption', path.basename(photo));
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
+    if (!r.ok) log(`TG 图片失败 ${path.basename(photo)}: ${await r.text()}`);
+  }
+}
+
+async function ocrPick(dir, prompt, n) {
+  const worker = await Tesseract.createWorker('eng');
+  await worker.setParameters({
+    tessedit_pageseg_mode: '7',
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+  });
+  const results = [];
+  for (let i = 0; i < n; i++) {
+    const file = path.join(dir, `${i}.png`);
+    const r = await worker.recognize(file);
+    const text = (r.data.text || '').replace(/\s+/g, '').trim();
+    const best = VOCAB.map((v) => ({ v, s: score(text, v) })).sort((p, q) => q.s - p.s)[0];
+    results.push({ i, text, guess: best.v, vsPrompt: score(text, prompt) || score(best.v, prompt) });
+  }
+  await worker.terminate();
+  results.sort((a, b) => b.vsPrompt - a.vsPrompt);
+  log(`OCR prompt=${prompt} ${results.map((x) => `${x.i}:${x.text || x.guess}(${x.vsPrompt})`).join(' ')}`);
+  if (!results[0] || results[0].vsPrompt < 80) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
+  return results[0].i;
+}
+
+async function solveCaptcha(page) {
+  await page.locator("div[role='checkbox']").click();
+  await page.waitForSelector('.auth-captcha-option-img', { timeout: 20000 });
+  await page.waitForFunction(() => [...document.querySelectorAll('.auth-captcha-option-img')].every((i) => i.naturalWidth > 0 && i.clientHeight > 0));
+  const promptRaw = await page.locator('.auth-captcha-prompt').innerText();
+  const prompt = promptRaw.replace(/^Click on\s+/i, '').trim();
+  const imgs = page.locator('.auth-captcha-option-img');
+  const n = await imgs.count();
+  const dir = path.join(SHOT, 'captcha');
+  fs.mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < n; i++) {
+    const src = await imgs.nth(i).getAttribute('src');
+    const url = src.startsWith('http') ? src : BASE + src;
+    const bytes = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'include' });
+      return Array.from(new Uint8Array(await r.arrayBuffer()));
+    }, url);
+    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
+  }
+  await shot(page, '02-captcha.png');
+  const pick = await ocrPick(dir, prompt, n);
+  await page.locator('.auth-captcha-option').nth(pick).evaluate((el) => el.click());
+  await page.waitForFunction(() => document.querySelector("[role='checkbox']")?.getAttribute('aria-checked') === 'true', { timeout: 15000 });
+  log(`验证码通过: ${prompt} -> option ${pick + 1}`);
+}
+
+async function api(page, p, method = 'GET', body) {
+  return page.evaluate(async ({ p, method, body }) => {
+    const token = document.cookie.split('; ').find((c) => c.startsWith('XSRF-TOKEN='))?.split('=')[1];
+    const res = await fetch(p, {
+      method,
+      headers: {
+        Accept: 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include',
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = text; }
+    return { status: res.status, data };
+  }, { p, method, body });
 }
 
 async function main() {
-  log(`目标: ${BASE}${SERVER_ID ? ` (server ${SERVER_ID})` : ' (自动发现)'}`);
-  if (DRY_RUN) log('DRY_RUN 模式: 仅查看,不续期');
-
-  const authed = await ensureAuth();
-  if (!authed) {
-    console.error('缺少会话: 请设置 ACL_SESSION(从浏览器导出 __Host-aclclouds_session cookie)或 ACL_EMAIL/ACL_PASSWORD');
-    process.exit(1);
-  }
-
-  // 1) 确定目标服务器
-  let targets = [];
-  if (SERVER_ID) {
-    targets = [{ id: SERVER_ID, name: SERVER_ID }];
-  } else {
-    const subs = await listServers();
-    log(`发现 ${subs.length} 个服务: ${subs.map(s => `${s.name}(${s.id}, 到期 ${s.expires_at || '?'})`).join(', ')}`);
-    targets = subs.map(s => ({ id: s.id, name: s.name, expires_at: s.expires_at }));
-  }
-  if (!targets.length) { log('没有可续期的服务'); process.exit(0); }
-
-  // 2) 逐个续期
-  let renewed = 0, skipped = 0, failed = 0;
-  for (const t of targets) {
-    if (DRY_RUN) { log(`[DRY] ${t.name} (${t.id}) 跳过续期`); continue; }
-    log(`续期 ${t.name} (${t.id}) …`);
-    const r = await renew(t.id);
-    if (r.status === 200) {
-      renewed++;
-      const newExp = r.data?.expires_at || r.data?.server?.expires_at;
-      log(`✅ 续期成功${newExp ? `,新到期时间: ${newExp}` : ''}`);
-    } else if (r.status === 400 && r.data?.error === 'renewal_not_available') {
-      skipped++;
-      const d = r.data.days_remaining, h = r.data.hours_remaining;
-      log(`⏳ 未到续期窗口(${d != null ? `还剩 ${d} 天` : h != null ? `还剩 ${h} 小时` : '时间未知'}),下次运行再试`);
-    } else if (r.status === 403 && r.data?.code === 'captcha_required') {
-      failed++;
-      log('🤖 站点要求人机验证(captcha_required),请在浏览器完成一次后续期');
-    } else if (r.status === 401) {
-      log('会话失效(401),尝试用邮箱密码重新登录…');
-      let retried = false;
-      if (process.env.ACL_EMAIL && process.env.ACL_PASSWORD && await login()) {
-        const r2 = await renew(t.id);
-        if (r2.status === 200) { renewed++; log('✅ 重新登录后续期成功'); continue; }
-        retried = true;
-        log(`重试结果: HTTP ${r2.status} ${JSON.stringify(r2.data).slice(0, 200)}`);
+  if (!USER || !PASS) throw new Error('缺少 ACL_USERNAME / ACL_PASSWORD');
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  let summary = '';
+  let failed = false;
+  try {
+    log(`登录 ${BASE} as ${USER}`);
+    await page.goto(`${BASE}/auth/login`, { waitUntil: 'domcontentloaded' });
+    await page.fill('#username', USER);
+    await page.fill('#password', PASS);
+    await shot(page, '01-login.png');
+    let authed = false;
+    for (let i = 0; i < 4 && !authed; i++) {
+      try {
+        await solveCaptcha(page);
+        authed = true;
+      } catch (e) {
+        log(`验证码失败(${i + 1}/4): ${e.message}`);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.fill('#username', USER);
+        await page.fill('#password', PASS);
       }
-      if (!retried) {
-        console.error('❌ 会话已失效且无法自动重新登录,请重新导出 ACL_SESSION cookie');
-        process.exit(1);
-      }
-      failed++;
-    } else {
-      failed++;
-      log(`⚠️ HTTP ${r.status}: ${JSON.stringify(r.data).slice(0, 300)}`);
     }
-  }
+    if (!authed) throw new Error('验证码多次失败');
+    await page.click("button[type='submit']");
+    await page.waitForURL(/\/dashboard/, { timeout: 25000 });
+    await shot(page, '03-dashboard.png');
+    log('登录成功');
 
-  log(`完成: 成功 ${renewed},未到窗口 ${skipped},失败 ${failed}`);
-  // exit code: 0=有成功或仅未到窗口(任务本身正常);1=需要人工介入
-  if (failed > 0 && renewed === 0) process.exit(1);
+    let targets = [];
+    if (SERVER_ID) {
+      targets = [{ id: SERVER_ID, name: SERVER_ID }];
+    } else {
+      const r = await api(page, '/api/client/credits/subscriptions');
+      if (r.status !== 200) throw new Error(`订阅列表失败 HTTP ${r.status}`);
+      const subs = (r.data.subscriptions || []).filter((s) => s.kind === 'server' || s.plan_name);
+      targets = subs.map((s) => ({ id: s.id, name: s.name, expires_at: s.expires_at }));
+      log(`发现 ${targets.length} 个服务`);
+    }
+    if (!targets.length) {
+      summary = '没有可续期的服务';
+    } else {
+      const t = targets[0];
+      await page.goto(`${BASE}/server/${t.id}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await shot(page, '04-server.png');
+      if (DRY_RUN) {
+        summary = `DRY_RUN ${t.name}(${t.id})`;
+      } else {
+        const r = await api(page, `/api/client/servers/${t.id}/upgrade/renew`, 'POST', {});
+        log(`续期 HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 300)}`);
+        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await shot(page, '05-result.png');
+        if (r.status === 200) summary = `续期成功 ${t.name}(${t.id}) ${r.data?.expires_at || ''}`;
+        else if (r.status === 400 && r.data?.error === 'renewal_not_available') {
+          summary = `未到续期窗口 ${t.name}(${t.id}) 剩余 ${r.data.days_remaining ?? '?'} 天`;
+        } else {
+          failed = true;
+          summary = `续期失败 HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 200)}`;
+        }
+      }
+    }
+  } catch (e) {
+    failed = true;
+    summary = `执行失败: ${e.message}`;
+    log(summary);
+    try { await shot(page, '99-error.png'); } catch {}
+  } finally {
+    await browser.close().catch(() => {});
+  }
+  log(summary);
+  await tg(`${failed ? '❌' : '✅'} ACLClouds 续期\n${summary}`);
+  if (failed) process.exit(1);
 }
 
-main().catch(e => { console.error('执行异常:', e.message); process.exit(1); });
+main().catch(async (e) => {
+  log(e.stack || e.message);
+  await tg(`❌ ACLClouds 续期崩溃\n${e.message}`);
+  process.exit(1);
+});

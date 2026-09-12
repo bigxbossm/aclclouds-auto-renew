@@ -1,0 +1,12 @@
+{
+  "name": "aclclouds-auto-renew",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "renew": "node renew.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.49.1",
+    "tesseract.js": "^5.1.1"
+  }
+}

@@ -1,4 +1,3 @@
-// 本地测试包装器:加载 .env 后运行 renew.mjs(GitHub Actions 中由 workflow 直接传 env)
 const fs = require('fs');
 const path = require('path');
 const envPath = path.join(__dirname, '.env');
