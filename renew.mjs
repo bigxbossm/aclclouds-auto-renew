@@ -48,7 +48,7 @@ async function shot(page, name) {
   return p;
 }
 
-async function tg(text) {
+async function tg(text, { photos = false } = {}) {
   const token = process.env.TG_BOT_TOKEN;
   const chat = process.env.TG_CHAT_ID;
   if (!token || !chat) {
@@ -61,6 +61,9 @@ async function tg(text) {
     body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
   });
   if (!msg.ok) log(`TG 文本失败: ${await msg.text()}`);
+  else log('TG 文本已发送');
+  if (!photos) return;
+  let n = 0;
   for (const photo of shots) {
     if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
     const form = new FormData();
@@ -69,7 +72,9 @@ async function tg(text) {
     form.append('caption', path.basename(photo));
     const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
     if (!r.ok) log(`TG 图片失败 ${path.basename(photo)}: ${await r.text()}`);
+    else n++;
   }
+  log(`TG 截图 ${n} 张`);
 }
 
 async function ocrPick(dir, prompt, n) {
@@ -286,12 +291,13 @@ async function main() {
     await browser.close().catch(() => {});
   }
   log(summary);
-  await tg(`${failed ? '❌' : '✅'} ACLClouds 续期\n${summary}`);
+  const skipped = /未到续期窗口/.test(summary);
+  await tg(`${failed ? '❌' : skipped ? '⏳' : '✅'} ACLClouds 续期\n${summary}`, { photos: failed });
   if (failed) process.exit(1);
 }
 
 main().catch(async (e) => {
   log(e.stack || e.message);
-  await tg(`❌ ACLClouds 续期崩溃\n${e.message}`);
+  await tg(`❌ ACLClouds 续期崩溃\n${e.message}`, { photos: true });
   process.exit(1);
 });
