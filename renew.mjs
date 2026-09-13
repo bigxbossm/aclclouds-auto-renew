@@ -345,6 +345,25 @@ async function login(page) {
   log(`登录成功,会话写入 ${AUTH}`);
 }
 
+function formatRemaining(expiresAt) {
+  if (!expiresAt) return null;
+  const target = new Date(expiresAt).getTime();
+  const diff = target - Date.now();
+  if (isNaN(diff)) return null;
+  if (diff <= 0) return '已到期';
+  const d = Math.floor(diff / 86400000);
+  const h = Math.floor((diff % 86400000) / 3600000);
+  const expStr = new Date(target).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  return `${d}天${h}小时 (到期: ${expStr})`;
+}
+
 async function discover(page) {
   const servers = [];
   const r = await api(page, '/api/client');
@@ -355,16 +374,18 @@ async function discover(page) {
           id: item.attributes.identifier,
           uuid: item.attributes.uuid,
           name: item.attributes.name || item.attributes.identifier,
+          expiresAt: item.attributes.expires_at || null,
+          canRenew: !!item.attributes.can_renew,
         });
       }
     }
   }
 
   if (SERVER_ID && !servers.some((s) => s.id === SERVER_ID || s.uuid === SERVER_ID)) {
-    servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
+    servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID, expiresAt: null, canRenew: false });
   }
 
-  log(`发现服务: ${servers.map((s) => `${s.name}(${s.id})`).join(', ') || '(无)'}`);
+  log(`发现服务: ${servers.map((s) => `${s.name}(${s.id}) 到期:${s.expiresAt || '未知'}`).join(', ') || '(无)'}`);
   return servers;
 }
 
@@ -440,8 +461,14 @@ async function tryRenew(page, server) {
     }
   }
 
-  log(`API 续期结果: ${c.text}`);
-  return { id, ok: c.ok, skip: c.skip, text: `${name} (${id}): ${c.text}` };
+  let resultText = `${name} (${id}): ${c.text}`;
+  const exactRemaining = formatRemaining(server.expiresAt);
+  if (c.skip && exactRemaining) {
+    resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;
+  }
+
+  log(`API 续期结果: ${resultText}`);
+  return { id, ok: c.ok, skip: c.skip, text: resultText };
 }
 
 function resolveExecutablePath() {
