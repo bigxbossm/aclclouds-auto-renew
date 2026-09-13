@@ -65,26 +65,35 @@ async function tg(text, { photos = false } = {}) {
     log('未配置 TG_BOT_TOKEN/TG_CHAT_ID,跳过通知');
     return;
   }
-  const msg = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
-  });
-  if (!msg.ok) log(`TG 文本失败: ${await msg.text()}`);
-  else log('TG 文本已发送');
+  try {
+    const msg = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
+    });
+    if (!msg.ok) log(`TG 文本失败: ${await msg.text()}`);
+    else log('TG 文本已发送');
+  } catch (e) {
+    log(`TG 发送异常 (非致命): ${e.message}`);
+  }
+
   if (!photos) return;
   let n = 0;
   for (const photo of shots) {
-    const base = path.basename(photo);
-    if (/^(01-login|02-captcha)\.png$/i.test(base) || photo.includes(`${path.sep}captcha${path.sep}`)) continue;
-    if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
-    const form = new FormData();
-    form.append('chat_id', chat);
-    form.append('photo', new Blob([fs.readFileSync(photo)], { type: 'image/png' }), path.basename(photo));
-    form.append('caption', path.basename(photo));
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
-    if (!r.ok) log(`TG 图片失败 ${path.basename(photo)}: ${await r.text()}`);
-    else n++;
+    try {
+      const base = path.basename(photo);
+      if (/^(01-login|02-captcha)\.png$/i.test(base) || photo.includes(`${path.sep}captcha${path.sep}`)) continue;
+      if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
+      const form = new FormData();
+      form.append('chat_id', chat);
+      form.append('photo', new Blob([fs.readFileSync(photo)], { type: 'image/png' }), path.basename(photo));
+      form.append('caption', path.basename(photo));
+      const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
+      if (!r.ok) log(`TG 图片失败 ${path.basename(photo)}: ${await r.text()}`);
+      else n++;
+    } catch (e) {
+      log(`TG 图片发送异常: ${e.message}`);
+    }
   }
   log(`TG 截图 ${n} 张`);
 }
