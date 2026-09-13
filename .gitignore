@@ -3,3 +3,4 @@
 node_modules/
 shots/
 .cache/
+auth.json

@@ -3,12 +3,14 @@ import { chromium } from 'playwright';
 import Tesseract from 'tesseract.js';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'node:url';
 
 const BASE = (process.env.ACL_BASE_URL || 'https://aclclouds.com').replace(/\/+$/, '');
 const USER = process.env.ACL_USERNAME || process.env.ACL_EMAIL || '';
 const PASS = process.env.ACL_PASSWORD || '';
 const SERVER_ID = process.env.ACL_SERVER_ID || '';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
+const AUTH = path.resolve(process.env.ACL_AUTH_STATE || 'auth.json');
 const SHOT = path.resolve('shots');
 const VOCAB = ['Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds', 'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated', 'Free', 'Upgrade', 'Renew'];
 
@@ -21,6 +23,10 @@ function log(msg) {
 
 function norm(s) {
   return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+}
+
+function ocrScore(text, guess, prompt) {
+  return Math.max(score(text, prompt), score(guess, prompt));
 }
 
 function score(a, b) {
@@ -91,7 +97,7 @@ async function ocrPick(dir, prompt, n) {
     const r = await worker.recognize(file);
     const text = (r.data.text || '').replace(/\s+/g, '').trim();
     const best = VOCAB.map((v) => ({ v, s: score(text, v) })).sort((p, q) => q.s - p.s)[0];
-    results.push({ i, text, guess: best.v, vsPrompt: score(text, prompt) || score(best.v, prompt) });
+    results.push({ i, text, guess: best.v, vsPrompt: ocrScore(text, best.v, prompt) });
   }
   await worker.terminate();
   results.sort((a, b) => b.vsPrompt - a.vsPrompt);
@@ -204,85 +210,119 @@ async function discover(page) {
 }
 
 function classifyRenew(r) {
-  if (r.status === 200) return { ok: true, skip: false, text: `续期成功 ${JSON.stringify(r.data).slice(0, 180)}` };
+  if (r.status === 200) return { ok: true, skip: false, captcha: false, text: `续期成功 ${JSON.stringify(r.data).slice(0, 180)}` };
   if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
-    return { ok: true, skip: true, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
+    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
   }
-  return { ok: false, skip: false, text: `HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 180)}` };
+  const blob = JSON.stringify(r.data);
+  if (r.status === 403 && /captcha_required/i.test(blob)) {
+    return { ok: false, skip: false, captcha: true, text: `HTTP 403 captcha_required` };
+  }
+  return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
+}
+
+async function loggedIn(page) {
+  if (/\/dashboard/i.test(page.url())) return true;
+  const r = await api(page, '/api/client/account');
+  return r.status === 200 && r.data?.object === 'user';
+}
+
+async function login(page) {
+  log(`登录 ${BASE} as ${USER}`);
+  await page.goto(`${BASE}/auth/login`, { waitUntil: 'domcontentloaded' });
+  if (await loggedIn(page)) {
+    log('已有会话,跳过验证码');
+    return;
+  }
+  if (fs.existsSync(AUTH)) {
+    log('会话失效,重新登录');
+    fs.unlinkSync(AUTH);
+  }
+  await page.fill('#username', USER);
+  await page.fill('#password', PASS);
+  await shot(page, '01-login.png');
+  let authed = false;
+  for (let i = 0; i < 4 && !authed; i++) {
+    try {
+      await solveCaptcha(page);
+      authed = true;
+    } catch (e) {
+      log(`验证码失败(${i + 1}/4): ${e.message}`);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.fill('#username', USER);
+      await page.fill('#password', PASS);
+    }
+  }
+  if (!authed) throw new Error('验证码多次失败');
+  await page.click("button[type='submit']");
+  await page.waitForURL(/\/dashboard/, { timeout: 25000 });
+  await page.context().storageState({ path: AUTH });
+  log(`登录成功,会话写入 ${AUTH}`);
+}
+
+async function tryRenew(page, id) {
+  const exists = await api(page, `/api/client/servers/${id}`);
+  log(`GET /api/client/servers/${id} -> ${exists.status}`);
+  if (exists.status === 404) return { id, ok: false, skip: false, text: `${id} HTTP 404` };
+  if (DRY_RUN) return { id, ok: true, skip: true, text: `DRY_RUN ${id} GET ${exists.status}` };
+  const paths = [
+    `/api/client/servers/${id}/upgrade/renew`,
+    `/api/client/servers/${id}/renew`,
+    `/api/client/account/servers/${id}/renew`,
+  ];
+  let last = { id, ok: false, skip: false, text: `${id} 无续期路径` };
+  for (const p of paths) {
+    let r = await api(page, p, 'POST', {});
+    let c = classifyRenew(r);
+    if (c.captcha) {
+      log(`POST ${p} -> captcha_required,再过一次验证码`);
+      try {
+        await solveCaptcha(page);
+        r = await api(page, p, 'POST', {});
+        c = classifyRenew(r);
+      } catch (e) {
+        c = { ok: false, skip: false, captcha: false, text: `续期验证码失败: ${e.message}` };
+      }
+    }
+    log(`POST ${p} -> ${c.text}`);
+    last = { id, ok: c.ok, skip: c.skip, text: `${id} ${c.text}` };
+    if (c.ok) return last;
+  }
+  return last;
 }
 
 async function main() {
   if (!USER || !PASS) throw new Error('缺少 ACL_USERNAME / ACL_PASSWORD');
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    storageState: fs.existsSync(AUTH) ? AUTH : undefined,
+  });
+  const page = await context.newPage();
   let summary = '';
   let failed = false;
   try {
-    log(`登录 ${BASE} as ${USER}`);
-    await page.goto(`${BASE}/auth/login`, { waitUntil: 'domcontentloaded' });
-    await page.fill('#username', USER);
-    await page.fill('#password', PASS);
-    await shot(page, '01-login.png');
-    let authed = false;
-    for (let i = 0; i < 4 && !authed; i++) {
-      try {
-        await solveCaptcha(page);
-        authed = true;
-      } catch (e) {
-        log(`验证码失败(${i + 1}/4): ${e.message}`);
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.fill('#username', USER);
-        await page.fill('#password', PASS);
-      }
-    }
-    if (!authed) throw new Error('验证码多次失败');
-    await page.click("button[type='submit']");
-    await page.waitForURL(/\/dashboard/, { timeout: 25000 });
+    await login(page);
     await shot(page, '03-dashboard.png');
-    log('登录成功');
 
     const ids = await discover(page);
     await page.goto(`${BASE}/dashboard/projects?type=discord`, { waitUntil: 'domcontentloaded' }).catch(() => {});
     await shot(page, '04-projects.png');
-    const btn = page.getByRole('button', { name: /renouvel|renew|续期/i }).first();
-    const link = page.getByRole('link', { name: /renouvel|renew|续期/i }).first();
-    if (await btn.count()) {
-      await btn.click().catch(() => {});
-      await page.waitForTimeout(1500);
-      await shot(page, '05-renew-click.png');
-    } else if (await link.count()) {
-      await link.click().catch(() => {});
-      await page.waitForTimeout(1500);
-      await shot(page, '05-renew-click.png');
-    }
 
-    const pathsFor = (id) => [
-      `/api/client/servers/${id}/upgrade/renew`,
-      `/api/client/servers/${id}/renew`,
-      `/api/client/account/servers/${id}/renew`,
-    ];
-    let best = null;
-    for (const id of ids) {
-      const exists = await api(page, `/api/client/servers/${id}`);
-      log(`GET /api/client/servers/${id} -> ${exists.status}`);
-      if (exists.status === 404) continue;
-      if (DRY_RUN) { best = { id, text: `DRY_RUN ${id} GET ${exists.status}` }; break; }
-      for (const p of pathsFor(id)) {
-        const r = await api(page, p, 'POST', {});
-        const c = classifyRenew(r);
-        log(`POST ${p} -> ${c.text}`);
-        if (c.ok) { best = { id, text: `${id} ${c.text}` }; break; }
-        if (!best) best = { id, text: `${id} ${c.text}` };
-      }
-      if (best && !String(best.text).includes('失败') && !String(best.text).includes('HTTP 404')) break;
+    const targets = SERVER_ID ? [SERVER_ID] : ids;
+    const results = [];
+    for (const id of targets) {
+      const one = await tryRenew(page, id);
+      if (one.text.includes('HTTP 404')) continue;
+      results.push(one);
     }
     await shot(page, '06-result.png');
-    if (!best) {
+    if (!results.length) {
       failed = true;
       summary = `未找到可续期服务 ids=${ids.join(',') || '空'}`;
     } else {
-      summary = best.text;
-      failed = /失败|HTTP 401|HTTP 403|HTTP 404|HTTP 5/.test(summary) && !/未到续期窗口|续期成功|DRY_RUN/.test(summary);
+      summary = results.map((r) => r.text).join('\n');
+      failed = results.some((r) => !r.ok);
     }
   } catch (e) {
     failed = true;
@@ -298,8 +338,13 @@ async function main() {
   if (failed) process.exit(1);
 }
 
-main().catch(async (e) => {
-  log(e.stack || e.message);
-  await tg(`❌ ACLClouds 续期崩溃\n${e.message}`, { photos: true });
-  process.exit(1);
-});
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  main().catch(async (e) => {
+    log(e.stack || e.message);
+    await tg(`❌ ACLClouds 续期崩溃\n${e.message}`, { photos: true });
+    process.exit(1);
+  });
+}
+
+export { score, ocrScore, classifyRenew };
