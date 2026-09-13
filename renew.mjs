@@ -58,7 +58,22 @@ async function shot(page, name) {
   return p;
 }
 
-async function tg(text, { photos = false } = {}) {
+async function sendTgPhoto(chat, token, photoPath, caption) {
+  if (!photoPath || !fs.existsSync(photoPath) || fs.statSync(photoPath).size < 100) return;
+  try {
+    const form = new FormData();
+    form.append('chat_id', chat);
+    form.append('photo', new Blob([fs.readFileSync(photoPath)], { type: 'image/png' }), path.basename(photoPath));
+    if (caption) form.append('caption', caption);
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
+    if (!r.ok) log(`TG 图片发送失败 ${path.basename(photoPath)}: ${await r.text()}`);
+    else log(`TG 图片已发送: ${path.basename(photoPath)}`);
+  } catch (e) {
+    log(`TG 图片发送异常: ${e.message}`);
+  }
+}
+
+async function tg(text, { photo = null } = {}) {
   const token = process.env.TG_BOT_TOKEN;
   const chat = process.env.TG_CHAT_ID;
   if (!token || !chat) {
@@ -69,33 +84,79 @@ async function tg(text, { photos = false } = {}) {
     const msg = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: chat, text, parse_mode: 'HTML', disable_web_page_preview: true }),
     });
-    if (!msg.ok) log(`TG 文本失败: ${await msg.text()}`);
-    else log('TG 文本已发送');
+    if (!msg.ok) {
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }),
+      });
+    }
+    log('TG 文本已发送');
   } catch (e) {
     log(`TG 发送异常 (非致命): ${e.message}`);
   }
 
-  if (!photos) return;
-  let n = 0;
-  for (const photo of shots) {
-    try {
-      const base = path.basename(photo);
-      if (/^(01-login|02-captcha)\.png$/i.test(base) || photo.includes(`${path.sep}captcha${path.sep}`)) continue;
-      if (!fs.existsSync(photo) || fs.statSync(photo).size < 100) continue;
-      const form = new FormData();
-      form.append('chat_id', chat);
-      form.append('photo', new Blob([fs.readFileSync(photo)], { type: 'image/png' }), path.basename(photo));
-      form.append('caption', path.basename(photo));
-      const r = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: 'POST', body: form });
-      if (!r.ok) log(`TG 图片失败 ${path.basename(photo)}: ${await r.text()}`);
-      else n++;
-    } catch (e) {
-      log(`TG 图片发送异常: ${e.message}`);
-    }
+  if (photo) {
+    await sendTgPhoto(chat, token, photo);
   }
-  log(`TG 截图 ${n} 张`);
+}
+
+function formatTgMessage({ failed, results = [], errorMsg = '' }) {
+  const beijingTime = new Date().toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+  const hasRenewed = results.some((r) => r.ok && !r.skip);
+  const allSkipped = results.length > 0 && results.every((r) => r.ok && r.skip);
+
+  let title = '✅ <b>【ACLClouds 自动续期成功】</b>';
+  let badge = '🎉 服务续期成功';
+  if (failed) {
+    title = '❌ <b>【ACLClouds 自动续期失败】</b>';
+    badge = '⚠️ 续期任务异常';
+  } else if (allSkipped) {
+    title = '⏳ <b>【ACLClouds 续期检查 - 未到窗口】</b>';
+    badge = 'ℹ️ 暂未到可续期时间';
+  }
+
+  const lines = [
+    title,
+    '━━━━━━━━━━━━━━━━━━━━',
+    `🕒 <b>执行时间</b>: ${beijingTime} (北京时间)`,
+    `👤 <b>当前账号</b>: <code>${USER || '未设置'}</code>`,
+    `📊 <b>任务状态</b>: ${badge}`,
+    '━━━━━━━━━━━━━━━━━━━━',
+    '<b>服务详情</b>:',
+  ];
+
+  if (failed && errorMsg) {
+    lines.push(`• 异常原因: ${errorMsg}`);
+  }
+
+  for (const r of results) {
+    const icon = r.ok ? (r.skip ? '⏳' : '✅') : '❌';
+    lines.push(`• ${icon} ${r.text}`);
+  }
+
+  lines.push('━━━━━━━━━━━━━━━━━━━━');
+  if (failed) {
+    lines.push('⚠️ 请及时查看 GitHub Actions 运行日志与失败截图排查。');
+  } else if (hasRenewed) {
+    lines.push('✨ 服务已成功延期，将在下次预定周期继续自动守护。');
+  } else {
+    lines.push('📌 站点限制到期前 2 天方可续期，下次执行将自动处理。');
+  }
+
+  return lines.join('\n');
 }
 
 async function ocrPick(dir, prompt, n) {
@@ -410,6 +471,7 @@ async function main() {
   const page = await context.newPage();
   let summary = '';
   let failed = false;
+  const results = [];
   try {
     await login(page);
     await shot(page, '03-dashboard.png');
@@ -417,12 +479,10 @@ async function main() {
     const servers = await discover(page);
     await shot(page, '04-projects.png');
 
-    const results = [];
     for (const server of servers) {
       const res = await tryRenew(page, server);
       results.push(res);
     }
-    await shot(page, '06-result.png');
 
     if (!results.length) {
       failed = true;
@@ -430,6 +490,11 @@ async function main() {
     } else {
       summary = results.map((r) => r.text).join('\n');
       failed = results.some((r) => !r.ok);
+    }
+
+    const hasRenewed = results.some((r) => r.ok && !r.skip);
+    if (hasRenewed) {
+      await shot(page, '06-result.png');
     }
   } catch (e) {
     failed = true;
@@ -440,8 +505,24 @@ async function main() {
     await browser.close().catch(() => {});
   }
   log(summary);
-  const skipped = /未到续期窗口/.test(summary);
-  await tg(`${failed ? '❌' : skipped ? '⏳' : '✅'} ACLClouds 续期\n${summary}`, { photos: failed });
+
+  // 截图仅限续期完成和执行失败
+  let photoToSend = null;
+  if (failed) {
+    const errPic = path.join(SHOT, '99-error.png');
+    if (fs.existsSync(errPic)) photoToSend = errPic;
+  } else if (results.some((r) => r.ok && !r.skip)) {
+    const donePic = path.join(SHOT, '06-result.png');
+    if (fs.existsSync(donePic)) photoToSend = donePic;
+  }
+
+  const tgMessage = formatTgMessage({
+    failed,
+    results,
+    errorMsg: failed && !results.length ? summary : '',
+  });
+
+  await tg(tgMessage, { photo: photoToSend });
   if (failed) process.exit(1);
 }
 
@@ -449,7 +530,13 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   main().catch(async (e) => {
     log(e.stack || e.message);
-    await tg(`❌ ACLClouds 续期崩溃\n${e.message}`, { photos: true });
+    const failPic = path.join(SHOT, '99-error.png');
+    const tgMessage = formatTgMessage({
+      failed: true,
+      results: [],
+      errorMsg: e.message,
+    });
+    await tg(tgMessage, { photo: fs.existsSync(failPic) ? failPic : null });
     process.exit(1);
   });
 }
