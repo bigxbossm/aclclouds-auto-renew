@@ -2,7 +2,7 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    - cron: '17 3 * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - uses: actions/cache@v4
         with:

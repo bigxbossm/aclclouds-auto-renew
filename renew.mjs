@@ -12,7 +12,11 @@ const SERVER_ID = process.env.ACL_SERVER_ID || '';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 const AUTH = path.resolve(process.env.ACL_AUTH_STATE || 'auth.json');
 const SHOT = path.resolve('shots');
-const VOCAB = ['Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds', 'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated', 'Free', 'Upgrade', 'Renew'];
+const VOCAB = [
+  'Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds',
+  'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated',
+  'Free', 'Upgrade', 'Renew', 'Game', 'Node', 'Credit', 'Support'
+];
 
 fs.mkdirSync(SHOT, { recursive: true });
 const shots = [];
@@ -23,10 +27,6 @@ function log(msg) {
 
 function norm(s) {
   return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
-}
-
-function ocrScore(text, guess, prompt) {
-  return Math.max(score(text, prompt), score(guess, prompt));
 }
 
 function score(a, b) {
@@ -44,6 +44,10 @@ function score(a, b) {
     }
   }
   return Math.max(0, 100 - dp[a.length][b.length] * 25);
+}
+
+function ocrScore(text, guess, prompt) {
+  return Math.max(score(text, prompt), score(guess, prompt));
 }
 
 async function shot(page, name) {
@@ -102,17 +106,27 @@ async function ocrPick(dir, prompt, n) {
   await worker.terminate();
   results.sort((a, b) => b.vsPrompt - a.vsPrompt);
   log(`OCR prompt=${prompt} ${results.map((x) => `${x.i}:${x.text || x.guess}(${x.vsPrompt})`).join(' ')}`);
-  if (!results[0] || results[0].vsPrompt < 80) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
+  if (!results[0] || results[0].vsPrompt < 75) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
   return results[0].i;
 }
 
-async function solveCaptcha(page) {
-  await page.locator("div[role='checkbox']").click();
-  await page.waitForSelector('.auth-captcha-option-img', { timeout: 20000 });
-  await page.waitForFunction(() => [...document.querySelectorAll('.auth-captcha-option-img')].every((i) => i.naturalWidth > 0 && i.clientHeight > 0));
-  const promptRaw = await page.locator('.auth-captcha-prompt').innerText();
-  const prompt = promptRaw.replace(/^Click on\s+/i, '').trim();
-  const imgs = page.locator('.auth-captcha-option-img');
+async function solveCaptcha(page, prefix = '') {
+  const root = prefix ? `${prefix} ` : '';
+  const checkbox = page.locator(`${root}div[role='checkbox']`).first();
+  await checkbox.click();
+  await page.waitForSelector(`${root}.auth-captcha-option-img`, { timeout: 20000 });
+  await page.waitForFunction(
+    (sel) => {
+      const imgs = [...document.querySelectorAll(sel)];
+      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
+    },
+    `${root}.auth-captcha-option-img`,
+    { timeout: 20000 }
+  );
+
+  const promptRaw = await page.locator(`${root}.auth-captcha-prompt`).innerText();
+  const prompt = promptRaw.replace(/^(?:Click on|Cliquez sur)\s+/i, '').trim();
+  const imgs = page.locator(`${root}.auth-captcha-option-img`);
   const n = await imgs.count();
   const dir = path.join(SHOT, 'captcha');
   fs.mkdirSync(dir, { recursive: true });
@@ -127,9 +141,78 @@ async function solveCaptcha(page) {
   }
   await shot(page, '02-captcha.png');
   const pick = await ocrPick(dir, prompt, n);
-  await page.locator('.auth-captcha-option').nth(pick).evaluate((el) => el.click());
-  await page.waitForFunction(() => document.querySelector("[role='checkbox']")?.getAttribute('aria-checked') === 'true', { timeout: 15000 });
+  await page.locator(`${root}.auth-captcha-option`).nth(pick).evaluate((el) => el.click());
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
+    `${root}div[role='checkbox']`,
+    { timeout: 15000 }
+  );
   log(`验证码通过: ${prompt} -> option ${pick + 1}`);
+}
+
+async function solveCaptchaApi(page, context = 'renewal_gate') {
+  log(`通过 API 求解验证码 (context: ${context})...`);
+  const challengeRes = await api(page, `/auth/captcha/challenge?context=${encodeURIComponent(context)}`);
+  if (challengeRes.status !== 200 || !challengeRes.data?.id) {
+    throw new Error(`获取验证码 challenge 失败: HTTP ${challengeRes.status}`);
+  }
+  const chal = challengeRes.data;
+  await page.waitForTimeout(1200);
+
+  const initialVerify = await api(page, '/auth/captcha', 'POST', {
+    context: chal.context || context,
+    id: chal.id,
+    ts: chal.ts,
+    sig: chal.sig,
+    elapsed: 1400,
+  });
+
+  if (initialVerify.status !== 200) {
+    throw new Error(`验证码初始验证失败: HTTP ${initialVerify.status}`);
+  }
+
+  const ver = initialVerify.data;
+  if (ver.passed && ver.token) {
+    log('验证码无感直通成功');
+    return ver.token;
+  }
+
+  if (!ver.interactive || !ver.target || !Array.isArray(ver.options)) {
+    throw new Error(`验证码返回非交互态: ${JSON.stringify(ver)}`);
+  }
+
+  const target = ver.target;
+  const options = ver.options;
+  const dir = path.join(SHOT, 'captcha_api');
+  fs.mkdirSync(dir, { recursive: true });
+
+  for (let i = 0; i < options.length; i++) {
+    const imgUrl = `${BASE}/auth/captcha/image?t=${encodeURIComponent(options[i])}`;
+    const bytes = await page.evaluate(async (u) => {
+      const r = await fetch(u, { credentials: 'include' });
+      return Array.from(new Uint8Array(await r.arrayBuffer()));
+    }, imgUrl);
+    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
+  }
+
+  const pick = await ocrPick(dir, target, options.length);
+  const selectedOption = options[pick];
+
+  const submitVerify = await api(page, '/auth/captcha', 'POST', {
+    context: ver.context || context,
+    id: ver.id,
+    ts: ver.ts,
+    sig: ver.sig,
+    answer: selectedOption,
+    answer_sig: ver.answer_sig || '',
+    target: target,
+  });
+
+  if (submitVerify.status === 200 && submitVerify.data?.passed && submitVerify.data?.token) {
+    log(`API 验证码成功解决: ${target} -> token 获得`);
+    return submitVerify.data.token;
+  }
+  throw new Error(`API 验证码选项提交未通过: ${JSON.stringify(submitVerify.data)}`);
 }
 
 async function api(page, p, method = 'GET', body) {
@@ -151,74 +234,6 @@ async function api(page, p, method = 'GET', body) {
     try { data = JSON.parse(text); } catch { data = text.slice(0, 400); }
     return { status: res.status, data };
   }, { p, method, body });
-}
-
-function collectIds(obj, out = new Set()) {
-  if (!obj) return out;
-  if (Array.isArray(obj)) { obj.forEach((x) => collectIds(x, out)); return out; }
-  if (typeof obj !== 'object') return out;
-  for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === 'string' && /^[a-z0-9-]{6,40}$/i.test(v) && /id|uuid|identifier/i.test(k)) out.add(v);
-    else if (v && typeof v === 'object') collectIds(v, out);
-  }
-  return out;
-}
-
-async function discover(page) {
-  const ids = new Set();
-  if (SERVER_ID) ids.add(SERVER_ID);
-  const pages = [
-    `${BASE}/dashboard`,
-    `${BASE}/dashboard/projects?type=discord`,
-    `${BASE}/dashboard/projects`,
-    `${BASE}/dashboard/billing/subscriptions`,
-  ];
-  if (SERVER_ID) pages.push(`${BASE}/server/${SERVER_ID}`);
-  const hrefs = [];
-  for (const url of pages) {
-    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    await page.waitForTimeout(1500);
-    const found = await page.evaluate(() => [...document.querySelectorAll('a[href]')].map((a) => a.href));
-    hrefs.push(...found);
-  }
-  for (const h of hrefs) {
-    const m = h.match(/\/(?:server|servers|project|projects|subscription|subscriptions)\/([a-z0-9-]{6,40})/i);
-    if (m) ids.add(m[1]);
-  }
-  const listPaths = [
-    '/api/client',
-    '/api/client/servers',
-    '/api/client/credits/subscriptions',
-    '/api/client/account',
-  ];
-  const dumps = [];
-  for (const p of listPaths) {
-    const r = await api(page, p);
-    dumps.push({ p, status: r.status, keys: r.data && typeof r.data === 'object' ? Object.keys(r.data).slice(0, 12) : String(r.data).slice(0, 80) });
-    collectIds(r.data, ids);
-    const arr = r.data?.data || r.data?.servers || r.data?.subscriptions || [];
-    if (Array.isArray(arr)) {
-      for (const s of arr) {
-        if (s?.id) ids.add(String(s.id));
-        if (s?.attributes?.identifier) ids.add(s.attributes.identifier);
-        if (s?.attributes?.uuid) ids.add(s.attributes.uuid);
-      }
-    }
-  }
-  log(`发现 ID: ${[...ids].join(', ') || '(无)'} dump=${JSON.stringify(dumps)}`);
-  return [...ids];
-}
-
-function classifyRenew(r) {
-  if (r.status === 200) return { ok: true, skip: false, captcha: false, text: `续期成功 ${JSON.stringify(r.data).slice(0, 180)}` };
-  if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
-    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
-  }
-  const blob = JSON.stringify(r.data);
-  if (r.status === 403 && /captcha_required/i.test(blob)) {
-    return { ok: false, skip: false, captcha: true, text: `HTTP 403 captcha_required` };
-  }
-  return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
 }
 
 async function loggedIn(page) {
@@ -260,42 +275,127 @@ async function login(page) {
   log(`登录成功,会话写入 ${AUTH}`);
 }
 
-async function tryRenew(page, id) {
-  const exists = await api(page, `/api/client/servers/${id}`);
-  log(`GET /api/client/servers/${id} -> ${exists.status}`);
-  if (exists.status === 404) return { id, ok: false, skip: false, text: `${id} HTTP 404` };
-  if (DRY_RUN) return { id, ok: true, skip: true, text: `DRY_RUN ${id} GET ${exists.status}` };
-  const paths = [
-    `/api/client/servers/${id}/upgrade/renew`,
-    `/api/client/servers/${id}/renew`,
-    `/api/client/account/servers/${id}/renew`,
-  ];
-  let last = { id, ok: false, skip: false, text: `${id} 无续期路径` };
-  for (const p of paths) {
-    let r = await api(page, p, 'POST', {});
-    let c = classifyRenew(r);
-    if (c.captcha) {
-      log(`POST ${p} -> captcha_required,再过一次验证码`);
-      try {
-        await solveCaptcha(page);
-        r = await api(page, p, 'POST', {});
-        c = classifyRenew(r);
-      } catch (e) {
-        c = { ok: false, skip: false, captcha: false, text: `续期验证码失败: ${e.message}` };
+async function discover(page) {
+  const servers = [];
+  const r = await api(page, '/api/client');
+  if (r.status === 200 && Array.isArray(r.data?.data)) {
+    for (const item of r.data.data) {
+      if (item.object === 'server' && item.attributes) {
+        servers.push({
+          id: item.attributes.identifier,
+          uuid: item.attributes.uuid,
+          name: item.attributes.name || item.attributes.identifier,
+        });
       }
     }
-    log(`POST ${p} -> ${c.text}`);
-    last = { id, ok: c.ok, skip: c.skip, text: `${id} ${c.text}` };
-    if (c.ok) return last;
   }
-  return last;
+
+  if (SERVER_ID && !servers.some((s) => s.id === SERVER_ID || s.uuid === SERVER_ID)) {
+    servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID });
+  }
+
+  log(`发现服务: ${servers.map((s) => `${s.name}(${s.id})`).join(', ') || '(无)'}`);
+  return servers;
+}
+
+function classifyRenew(r) {
+  if (r.status === 200) {
+    const exp = r.data?.expires_at ? ` (到期: ${r.data.expires_at})` : '';
+    return { ok: true, skip: false, captcha: false, text: `续期成功${exp} ${r.data?.message || JSON.stringify(r.data).slice(0, 120)}` };
+  }
+  if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
+    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
+  }
+  const blob = JSON.stringify(r.data);
+  if (r.status === 403 && /captcha_required/i.test(blob)) {
+    return { ok: false, skip: false, captcha: true, text: 'HTTP 403 captcha_required' };
+  }
+  return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
+}
+
+async function tryRenew(page, server) {
+  const id = server.id;
+  const name = server.name || id;
+  log(`开始检查续期: ${name} (${id})`);
+
+  if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
+
+  // 1. UI 自动化续期
+  await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const renewBtn = page.locator('button:has-text("Renouveler"), button:has-text("Renew")').first();
+  const hasBtn = (await renewBtn.count()) > 0;
+
+  if (hasBtn) {
+    log(`找到 UI 续期按钮,执行点击...`);
+    await renewBtn.click();
+    await page.waitForTimeout(2000);
+
+    const modal = page.locator("[role='dialog']");
+    if ((await modal.count()) > 0) {
+      log('检测到防机器人人机验证弹窗,开始过盾...');
+      try {
+        await solveCaptcha(page, "[role='dialog']");
+        await page.waitForTimeout(4000);
+      } catch (e) {
+        log(`弹窗验证码处理异常: ${e.message}`);
+      }
+    }
+
+    // 验证 UI 结果
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
+      const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
+      const exp = match ? `剩余 ${match[1]}` : '成功延期';
+      log(`UI 续期验证成功: ${exp}`);
+      return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+    }
+  }
+
+  // 2. API 直接续期及验证码补发
+  log(`尝试 API 续期接口...`);
+  const renewPath = `/api/client/servers/${id}/upgrade/renew`;
+  let r = await api(page, renewPath, 'POST', {});
+  let c = classifyRenew(r);
+
+  if (c.captcha) {
+    log(`检测到 captcha_required,获取 renewal_gate 验证码凭据...`);
+    try {
+      const token = await solveCaptchaApi(page, 'renewal_gate');
+      r = await api(page, renewPath, 'POST', { captcha_token: token });
+      c = classifyRenew(r);
+    } catch (e) {
+      c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
+    }
+  }
+
+  log(`API 续期结果: ${c.text}`);
+  return { id, ok: c.ok, skip: c.skip, text: `${name} (${id}): ${c.text}` };
+}
+
+function resolveExecutablePath() {
+  const paths = [
+    process.env.CHROME_PATH,
+    'D:\\PlaywrightBrowsers\\chromium-1217\\chrome-win64\\chrome.exe',
+  ].filter(Boolean);
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return undefined;
 }
 
 async function main() {
   if (!USER || !PASS) throw new Error('缺少 ACL_USERNAME / ACL_PASSWORD');
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const execPath = resolveExecutablePath();
+  const launchOptions = {
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    ...(execPath ? { executablePath: execPath } : {}),
+  };
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1440, height: 900 },
     storageState: fs.existsSync(AUTH) ? AUTH : undefined,
   });
   const page = await context.newPage();
@@ -305,21 +405,19 @@ async function main() {
     await login(page);
     await shot(page, '03-dashboard.png');
 
-    const ids = await discover(page);
-    await page.goto(`${BASE}/dashboard/projects?type=discord`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    const servers = await discover(page);
     await shot(page, '04-projects.png');
 
-    const targets = SERVER_ID ? [SERVER_ID] : ids;
     const results = [];
-    for (const id of targets) {
-      const one = await tryRenew(page, id);
-      if (one.text.includes('HTTP 404')) continue;
-      results.push(one);
+    for (const server of servers) {
+      const res = await tryRenew(page, server);
+      results.push(res);
     }
     await shot(page, '06-result.png');
+
     if (!results.length) {
       failed = true;
-      summary = `未找到可续期服务 ids=${ids.join(',') || '空'}`;
+      summary = '未找到可续期服务';
     } else {
       summary = results.map((r) => r.text).join('\n');
       failed = results.some((r) => !r.ok);
